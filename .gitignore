@@ -4,6 +4,7 @@ __pycache__/
 .env
 .DS_Store
 debug.html
+debug_*.html
 *.log
 .pytest_cache/
 .vscode/
