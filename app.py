@@ -1,16 +1,13 @@
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 import requests
 import re
 import os
-import time
-from collections import defaultdict
-from datetime import datetime, timedelta
 import logging
+from datetime import datetime
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -22,109 +19,118 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Rate limiting (simple in-memory store)
-rate_limit_store = defaultdict(list)
+# Read CORS origins from environment variable
+ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000")
+ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",")]
 
-def rate_limit_check(client_ip: str, max_requests: int = 10, time_window: int = 60):
-    """Rate limiting: max_requests per time_window seconds"""
-    now = time.time()
-    window_start = now - time_window
-    
-    # Clean old requests
-    rate_limit_store[client_ip] = [
-        req_time for req_time in rate_limit_store[client_ip] 
-        if req_time > window_start
-    ]
-    
-    if len(rate_limit_store[client_ip]) >= max_requests:
-        return False
-    
-    rate_limit_store[client_ip].append(now)
-    return True
+# Get environment
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 
-# Production CORS configuration
-ALLOWED_ORIGINS = [
-    "https://www.shopyor.com",
-    "https://shopyor.com",
-    "https://shopyor.onrender.com",  # If you use Render
-    "http://localhost:3000",  # Local Next.js development
-    "http://localhost:8000",   # Local API development
-]
+logger.info(f"Running in {ENVIRONMENT} mode")
+logger.info(f"Allowed origins: {ALLOWED_ORIGINS}")
 
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "OPTIONS"],  # Only GET for downloading
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
-    max_age=3600,
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["*"],
 )
 
-# Optional: Add API key authentication
-security = HTTPBearer(auto_error=False)
-
-async def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials] = None):
-    """Optional API key verification"""
-    api_key = os.getenv("API_KEY")
-    if not api_key:  # If no API key is set, allow all requests
-        return True
-    
-    if not credentials:
-        return False
-    
-    return credentials.credentials == api_key
-
-# Your existing video extraction functions here...
-# (Keep all the extraction functions from previous code)
-
 def extract_video_from_facebook(url: str) -> Dict[str, Any]:
-    """Extract video URL from Facebook using multiple methods"""
-    # ... (keep your existing implementation)
-    pass
-
-@app.middleware("http")
-async def add_security_headers(request: Request, call_next):
-    """Add security headers to all responses"""
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    return response
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    """Apply rate limiting"""
-    client_ip = request.client.host if request.client else "unknown"
+    """Extract video URL from Facebook"""
     
-    # Skip rate limiting for health check
-    if request.url.path == "/health":
-        return await call_next(request)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+    }
     
-    if not rate_limit_check(client_ip):
-        return JSONResponse(
-            status_code=429,
-            content={
-                "success": False,
-                "message": "Too many requests. Please try again later.",
-                "error": "Rate limit exceeded"
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        html_content = response.text
+        
+        # Look for video URLs
+        patterns = [
+            r'"hd_src":"([^"]+)"',
+            r'"sd_src":"([^"]+)"',
+            r'"browser_native_hd_url":"([^"]+)"',
+            r'"browser_native_sd_url":"([^"]+)"',
+            r'"playable_url":"([^"]+)"',
+            r'video_url:"([^"]+)"',
+        ]
+        
+        video_url = None
+        for pattern in patterns:
+            matches = re.findall(pattern, html_content)
+            if matches:
+                video_url = matches[0]
+                video_url = video_url.replace('\\/', '/')
+                logger.info(f"Found video URL with pattern: {pattern[:50]}")
+                break
+        
+        # Extract title
+        title_patterns = [
+            r'<meta property="og:title" content="([^"]+)"',
+            r'<title>([^<]+)</title>'
+        ]
+        
+        title = "Facebook Video"
+        for pattern in title_patterns:
+            match = re.search(pattern, html_content)
+            if match:
+                title = match.group(1)
+                break
+        
+        if video_url:
+            return {
+                'success': True,
+                'title': title,
+                'video_url': video_url,
             }
-        )
-    
-    return await call_next(request)
+        else:
+            # Save HTML for debugging (only in development)
+            if ENVIRONMENT == "development":
+                with open('debug.html', 'w', encoding='utf-8') as f:
+                    f.write(html_content)
+                logger.info("Saved debug.html for inspection")
+            
+            return {
+                'success': False,
+                'error': "Could not extract video URL. The video might be private or the page structure has changed."
+            }
+            
+    except requests.RequestException as e:
+        logger.error(f"Request error: {str(e)}")
+        return {
+            'success': False,
+            'error': f"Failed to fetch video page: {str(e)}"
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
 
 @app.get("/")
 async def root():
     return {
         "message": "Facebook Video Downloader API",
         "version": "1.0.0",
+        "status": "running",
+        "environment": ENVIRONMENT,
+        "allowed_origins": ALLOWED_ORIGINS,
         "endpoints": {
             "/download": "GET - Download video info",
             "/health": "GET - Health check",
             "/extract-info": "GET - Extract basic info"
-        },
-        "documentation": "/docs",
-        "allowed_origins": ALLOWED_ORIGINS
+        }
     }
 
 @app.get("/health")
@@ -132,6 +138,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "facebook-video-downloader",
+        "environment": ENVIRONMENT,
         "timestamp": datetime.now().isoformat()
     }
 
@@ -139,19 +146,13 @@ async def health_check():
 async def download_video(
     request: Request,
     url: str = Query(..., description="Facebook video URL"),
-    quality: Optional[str] = Query(None, description="Video quality (hd/sd)")
 ):
-    """
-    Download Facebook video from URL
-    """
-    # Log request origin
-    origin = request.headers.get("origin")
-    logger.info(f"Download request from origin: {origin}, URL: {url}")
+    """Download Facebook video from URL"""
     
-    # Validate origin (optional additional check)
-    if origin and origin not in ALLOWED_ORIGINS and not origin.startswith("http://localhost"):
-        logger.warning(f"Request from unauthorized origin: {origin}")
-        # Still process but log warning (or you can block if needed)
+    # Log request details
+    client_ip = request.client.host if request.client else "unknown"
+    origin = request.headers.get("origin", "unknown")
+    logger.info(f"Download request - IP: {client_ip}, Origin: {origin}, URL: {url[:100]}")
     
     try:
         # Validate URL
@@ -169,19 +170,14 @@ async def download_video(
         result = extract_video_from_facebook(url)
         
         if result.get('success'):
-            response_data = {
-                'title': result['title'],
-                'video_url': result['video_url'],
-                'thumbnail': result.get('thumbnail'),
-                'duration': result.get('duration'),
-                'selected_quality': quality or 'best'
-            }
-            
-            return JSONResponse(content={
+            return {
                 "success": True,
                 "message": "Video retrieved successfully",
-                "data": response_data
-            })
+                "data": {
+                    'title': result['title'],
+                    'video_url': result['video_url'],
+                }
+            }
         else:
             return JSONResponse(
                 status_code=404,
@@ -203,7 +199,52 @@ async def download_video(
             }
         )
 
-# Keep your other endpoints (direct download, extract-info, etc.)
+@app.get("/download/direct")
+async def direct_download(
+    url: str = Query(..., description="Facebook video URL"),
+    redirect: bool = Query(True, description="Redirect to video URL")
+):
+    """Direct download endpoint"""
+    result = await download_video(url)
+    
+    if result.get('success') and result.get('data', {}).get('video_url'):
+        video_url = result['data']['video_url']
+        if redirect:
+            return RedirectResponse(url=video_url)
+        else:
+            return {"download_url": video_url, "title": result['data'].get('title')}
+    else:
+        raise HTTPException(status_code=400, detail=result.get('message', 'Failed to get video'))
+
+@app.get("/extract-info")
+async def extract_video_info(url: str = Query(..., description="Facebook video URL")):
+    """Extract basic video information"""
+    try:
+        video_id_match = re.search(r'videos[/=](\d+)', url)
+        if not video_id_match:
+            video_id_match = re.search(r'reel[/=](\d+)', url)
+        
+        video_id = video_id_match.group(1) if video_id_match else None
+        
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        title_match = re.search(r'<title>([^<]+)</title>', response.text)
+        title = title_match.group(1) if title_match else "Facebook Video"
+        
+        return {
+            "success": True,
+            "video_id": video_id,
+            "title": title,
+            "url": url
+        }
+        
+    except Exception as e:
+        logger.error(f"Extract info error: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 if __name__ == "__main__":
     import uvicorn
