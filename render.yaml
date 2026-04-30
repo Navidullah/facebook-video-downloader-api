@@ -2,7 +2,7 @@ services:
   - type: web
     name: facebook-video-downloader-api
     runtime: python
-    repo: https://github.com/YOUR_USERNAME/facebook-video-downloader-api
+    repo: https://github.com/Navidullah/facebook-video-downloader-api
     plan: free
     envVars:
       - key: PYTHON_VERSION

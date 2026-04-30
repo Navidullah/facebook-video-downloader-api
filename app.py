@@ -1,17 +1,19 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import requests
 import re
-import json
 import os
-from urllib.parse import urlparse, parse_qs
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta
 import logging
 
 # Setup logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -20,132 +22,96 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS middleware
+# Rate limiting (simple in-memory store)
+rate_limit_store = defaultdict(list)
+
+def rate_limit_check(client_ip: str, max_requests: int = 10, time_window: int = 60):
+    """Rate limiting: max_requests per time_window seconds"""
+    now = time.time()
+    window_start = now - time_window
+    
+    # Clean old requests
+    rate_limit_store[client_ip] = [
+        req_time for req_time in rate_limit_store[client_ip] 
+        if req_time > window_start
+    ]
+    
+    if len(rate_limit_store[client_ip]) >= max_requests:
+        return False
+    
+    rate_limit_store[client_ip].append(now)
+    return True
+
+# Production CORS configuration
+ALLOWED_ORIGINS = [
+    "https://www.shopyor.com",
+    "https://shopyor.com",
+    "https://shopyor.onrender.com",  # If you use Render
+    "http://localhost:3000",  # Local Next.js development
+    "http://localhost:8000",   # Local API development
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "OPTIONS"],  # Only GET for downloading
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    max_age=3600,
 )
 
-class DownloadResponse(BaseModel):
-    success: bool
-    message: str
-    data: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
+# Optional: Add API key authentication
+security = HTTPBearer(auto_error=False)
 
-# Simplified video extraction that works
+async def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials] = None):
+    """Optional API key verification"""
+    api_key = os.getenv("API_KEY")
+    if not api_key:  # If no API key is set, allow all requests
+        return True
+    
+    if not credentials:
+        return False
+    
+    return credentials.credentials == api_key
+
+# Your existing video extraction functions here...
+# (Keep all the extraction functions from previous code)
+
 def extract_video_from_facebook(url: str) -> Dict[str, Any]:
     """Extract video URL from Facebook using multiple methods"""
+    # ... (keep your existing implementation)
+    pass
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Add security headers to all responses"""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Apply rate limiting"""
+    client_ip = request.client.host if request.client else "unknown"
     
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
-    }
+    # Skip rate limiting for health check
+    if request.url.path == "/health":
+        return await call_next(request)
     
-    try:
-        # First, get the page content
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        
-        html_content = response.text
-        logger.debug(f"Got HTML content length: {len(html_content)}")
-        
-        # Method 1: Look for HD/SD source in JavaScript
-        patterns = [
-            r'"hd_src":"([^"]+)"',
-            r'"sd_src":"([^"]+)"',
-            r'"browser_native_hd_url":"([^"]+)"',
-            r'"browser_native_sd_url":"([^"]+)"',
-            r'"playable_url":"([^"]+)"',
-            r'"playable_url_quality_hd":"([^"]+)"',
-            r'hd_src_no_ratelimit:"([^"]+)"',
-            r'sd_src_no_ratelimit:"([^"]+)"',
-            r'video_url:"([^"]+)"',
-            r'"downloadable_urls":\["([^"]+)"',
-        ]
-        
-        video_url = None
-        for pattern in patterns:
-            matches = re.findall(pattern, html_content)
-            if matches:
-                video_url = matches[0]
-                # Clean the URL
-                video_url = video_url.replace('\\/', '/')
-                logger.info(f"Found video URL with pattern: {pattern}")
-                break
-        
-        # Method 2: Look for video elements
-        if not video_url:
-            video_pattern = r'<meta property="og:video" content="([^"]+)"'
-            match = re.search(video_pattern, html_content)
-            if match:
-                video_url = match.group(1)
-                logger.info("Found video URL from og:video meta tag")
-        
-        # Method 3: Look for video URLs in page source
-        if not video_url:
-            mp4_patterns = [
-                r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*',
-                r'https?://video-[^\s"\'<>]+\.fbcdn\.net[^\s"\'<>]+',
-                r'https?://[^\s"\'<>]+fbcdn\.net[^\s"\'<>]+\.mp4[^\s"\'<>]*'
-            ]
-            
-            for pattern in mp4_patterns:
-                matches = re.findall(pattern, html_content)
-                if matches:
-                    video_url = matches[0]
-                    logger.info(f"Found video URL from mp4 pattern: {pattern}")
-                    break
-        
-        # Extract title
-        title_patterns = [
-            r'<meta property="og:title" content="([^"]+)"',
-            r'<title>([^<]+)</title>'
-        ]
-        
-        title = "Facebook Video"
-        for pattern in title_patterns:
-            match = re.search(pattern, html_content)
-            if match:
-                title = match.group(1)
-                break
-        
-        if video_url:
-            return {
-                'success': True,
-                'title': title,
-                'video_url': video_url,
-                'thumbnail': None,
-                'duration': None
+    if not rate_limit_check(client_ip):
+        return JSONResponse(
+            status_code=429,
+            content={
+                "success": False,
+                "message": "Too many requests. Please try again later.",
+                "error": "Rate limit exceeded"
             }
-        else:
-            # Save HTML for debugging (optional)
-            with open('debug.html', 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            logger.error("No video URL found in HTML")
-            return {
-                'success': False,
-                'error': "Could not extract video URL. The video might be private or the page structure has changed."
-            }
-            
-    except requests.RequestException as e:
-        logger.error(f"Request error: {str(e)}")
-        return {
-            'success': False,
-            'error': f"Failed to fetch video page: {str(e)}"
-        }
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        return {
-            'success': False,
-            'error': f"Error processing video: {str(e)}"
-        }
+        )
+    
+    return await call_next(request)
 
 @app.get("/")
 async def root():
@@ -156,30 +122,47 @@ async def root():
             "/download": "GET - Download video info",
             "/health": "GET - Health check",
             "/extract-info": "GET - Extract basic info"
-        }
+        },
+        "documentation": "/docs",
+        "allowed_origins": ALLOWED_ORIGINS
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "facebook-video-downloader"}
+    return {
+        "status": "healthy",
+        "service": "facebook-video-downloader",
+        "timestamp": datetime.now().isoformat()
+    }
 
-@app.get("/download", response_model=DownloadResponse)
+@app.get("/download")
 async def download_video(
+    request: Request,
     url: str = Query(..., description="Facebook video URL"),
     quality: Optional[str] = Query(None, description="Video quality (hd/sd)")
 ):
     """
     Download Facebook video from URL
     """
-    logger.info(f"Download request for URL: {url}")
+    # Log request origin
+    origin = request.headers.get("origin")
+    logger.info(f"Download request from origin: {origin}, URL: {url}")
+    
+    # Validate origin (optional additional check)
+    if origin and origin not in ALLOWED_ORIGINS and not origin.startswith("http://localhost"):
+        logger.warning(f"Request from unauthorized origin: {origin}")
+        # Still process but log warning (or you can block if needed)
     
     try:
         # Validate URL
         if not url or 'facebook.com' not in url.lower():
-            return DownloadResponse(
-                success=False,
-                message="Invalid Facebook URL",
-                error="URL must contain facebook.com"
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "message": "Invalid Facebook URL",
+                    "error": "URL must contain facebook.com"
+                }
             )
         
         # Extract video
@@ -194,81 +177,33 @@ async def download_video(
                 'selected_quality': quality or 'best'
             }
             
-            return DownloadResponse(
-                success=True,
-                message="Video retrieved successfully",
-                data=response_data
-            )
+            return JSONResponse(content={
+                "success": True,
+                "message": "Video retrieved successfully",
+                "data": response_data
+            })
         else:
-            return DownloadResponse(
-                success=False,
-                message="Failed to extract video",
-                error=result.get('error', 'Unknown error')
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "message": "Failed to extract video",
+                    "error": result.get('error', 'Unknown error')
+                }
             )
         
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-        return DownloadResponse(
-            success=False,
-            message="Internal server error",
-            error=str(e)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "message": "Internal server error",
+                "error": str(e)
+            }
         )
 
-@app.get("/download/direct")
-async def direct_download(
-    url: str = Query(..., description="Facebook video URL"),
-    redirect: bool = Query(True, description="Redirect to video URL")
-):
-    """
-    Direct download endpoint
-    """
-    result = await download_video(url)
-    
-    if result.success and result.data and result.data.get('video_url'):
-        if redirect:
-            return RedirectResponse(url=result.data['video_url'])
-        else:
-            return {"download_url": result.data['video_url'], "title": result.data.get('title')}
-    else:
-        raise HTTPException(status_code=400, detail=result.message)
-
-@app.get("/extract-info")
-async def extract_video_info(url: str = Query(..., description="Facebook video URL")):
-    """
-    Extract video information without download URL
-    """
-    try:
-        # Extract video ID
-        video_id_match = re.search(r'videos[/=](\d+)', url)
-        if not video_id_match:
-            video_id_match = re.search(r'reel[/=](\d+)', url)
-        
-        video_id = video_id_match.group(1) if video_id_match else None
-        
-        # Get page title
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        title = soup.find('meta', property='og:title')
-        thumbnail = soup.find('meta', property='og:image')
-        
-        return {
-            "success": True,
-            "video_id": video_id,
-            "title": title.get('content') if title else "Facebook Video",
-            "thumbnail": thumbnail.get('content') if thumbnail else None,
-            "url": url
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+# Keep your other endpoints (direct download, extract-info, etc.)
 
 if __name__ == "__main__":
     import uvicorn
